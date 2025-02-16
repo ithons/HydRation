@@ -375,18 +375,16 @@ def evaluate_detection(signal, peaks, valleys, notches, fs):
         'within_expected': min_expected <= len(peaks) <= max_expected
     }
 
-def analyze_ppg_cycle(signal, fs, show_plot=False, window_length_sec=0.5):
-    """
-    Analyze PPG signal using area-based calculations
-    """
+def analyze_ppg_cycle(signal, fs, show_plot=False):
+    """Analyze PPG signal using area-based calculations"""
     # Create smoothed baseline for normalization
-    window_length = int(fs * window_length_sec)  # Convert seconds to samples
+    window_length = int(fs * 0.5)  # 500ms window
     if window_length % 2 == 0:  # Make window length odd
         window_length += 1
     baseline = sp.savgol_filter(signal, window_length, 2)  # Use quadratic polynomial
     
-    # Normalize signal by subtracting baseline (instead of dividing)
-    normalized_signal = signal - baseline
+    # Normalize signal to baseline
+    normalized_signal = signal / baseline
     
     # Optional: Apply light smoothing to normalized signal
     normalized_signal = sp.savgol_filter(normalized_signal, 5, 2)  # Small window for noise reduction
@@ -450,6 +448,7 @@ def analyze_ppg_cycle(signal, fs, show_plot=False, window_length_sec=0.5):
         plt.plot(time, normalized_signal, label='Normalized PPG Signal')
         plt.plot(peaks/fs, normalized_signal[peaks], 'ro', label='Peaks')
         plt.plot(valleys/fs, normalized_signal[valleys], 'go', label='Valleys')
+        plt.plot(time, baseline/np.mean(baseline), 'k--', alpha=0.5, label='Baseline')
         
         # Plot complete envelopes
         plt.plot(time, upper_envelope, 'b--', alpha=0.5, label='Upper Envelope')

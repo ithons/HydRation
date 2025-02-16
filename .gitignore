@@ -47,3 +47,5 @@ Thumbs.db
 *.pyw
 /venv
 /data/regular
+/data/video
+/weights
