@@ -1,8 +1,9 @@
 # Media directory
-app/media/
-app/media/*
-app/output_results.json
-app/serviceAccountKey.json
+media/
+media/*
+serviceAccountKey.json
+*/serviceAccountKey.json
+**/serviceAccountKey.json
 
 # Python
 __pycache__/

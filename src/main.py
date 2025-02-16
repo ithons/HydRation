@@ -1,11 +1,11 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.signal as sp
-from simple_ppg import analyze_video_chrom
+from src.simple_ppg import analyze_video_chrom
 import pandas as pd
 import os
 from glob import glob
-from utils import analyze_ppg_cycle, classify_hydration
+from src.utils import analyze_ppg_cycle, classify_hydration
 
 def analyze_file(filepath, show_plot=False):
     """Analyze a single file"""
