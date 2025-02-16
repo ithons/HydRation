@@ -5,7 +5,7 @@ import numpy as np
 from scipy.signal import butter, filtfilt, savgol_filter
 from multiprocessing import Pool, cpu_count
 import matplotlib.pyplot as plt
-from main import analyze_ppg_cycle
+from utils import analyze_ppg_cycle
 
 def butter_bandpass(low, high, fs, order=2):
     """Create Butterworth bandpass filter"""
