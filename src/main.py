@@ -1,7 +1,8 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy import signal as sp
 import pandas as pd
+import matplotlib.pyplot as plt
+import scipy.signal as sp
+from scipy.interpolate import interp1d
 import os
 from glob import glob
 
@@ -164,31 +165,22 @@ def analyze_ppg(signal, fs):
     # Find zero crossings in first derivative (potential peaks)
     zero_crossings = np.where(np.diff(np.signbit(d1)))[0]
     
-    # Filter zero crossings to only get negative-to-positive (peaks)
-    peak_candidates = zero_crossings[d1[zero_crossings] >= 0]
-    
-    # Calculate prominence for each candidate
-    prominences = []
-    for peak in peak_candidates:
-        # Look for valleys on both sides
-        left_idx = max(0, peak - min_distance)
-        right_idx = min(len(signal), peak + min_distance)
-        
-        left_min = np.min(signal[left_idx:peak])
-        right_min = np.min(signal[peak:right_idx])
-        
-        # Calculate prominence as height above higher of the two valleys
-        prominence = signal[peak] - max(left_min, right_min)
-        prominences.append(prominence)
-    
-    prominences = np.array(prominences)
+    # Separate into peaks (positive to negative) and valleys (negative to positive)
+    peak_candidates = []
+    for i in range(len(zero_crossings)-1):
+        idx = zero_crossings[i]
+        # Check if it's a valid peak or valley
+        if d1[idx] >= 0 and d1[idx+1] < 0:  # Positive to negative = peak
+            # Confirm it's a true peak using second derivative
+            if d1[idx] > 0 and signal[idx] > np.mean(signal):
+                peak_candidates.append(idx)
     
     # Filter peaks by prominence and minimum distance
     valid_peaks = []
     last_peak = -min_distance  # Initialize with impossible peak position
     
-    for idx, (peak, prom) in enumerate(zip(peak_candidates, prominences)):
-        if prom > 0.05 and peak - last_peak >= min_distance:
+    for peak in peak_candidates:
+        if peak - last_peak >= min_distance:
             valid_peaks.append(peak)
             last_peak = peak
     
@@ -385,79 +377,63 @@ def evaluate_detection(signal, peaks, valleys, notches, fs):
 
 def analyze_ppg_cycle(signal, fs, show_plot=False):
     """Analyze PPG signal using area-based calculations"""
-    # Find main peaks with lower prominence to catch more peaks
-    peaks, _ = sp.find_peaks(signal, distance=int(fs * 60/180), prominence=0.05)
+    # Create smoothed baseline for normalization
+    window_length = int(fs * 0.5)  # 500ms window
+    if window_length % 2 == 0:  # Make window length odd
+        window_length += 1
+    baseline = sp.savgol_filter(signal, window_length, 2)  # Use quadratic polynomial
     
-    # Find main valleys
-    valleys, _ = sp.find_peaks(-signal, distance=int(fs * 60/180), prominence=0.05)
+    # Normalize signal to baseline
+    normalized_signal = signal / baseline
     
-    # Ensure we have alternating peaks and valleys
-    valid_peaks = []
-    valid_valleys = []
+    # Optional: Apply light smoothing to normalized signal
+    normalized_signal = sp.savgol_filter(normalized_signal, 5, 2)  # Small window for noise reduction
     
-    # Start with the first valley
-    if len(peaks) > 0 and len(valleys) > 0:
-        # Find first valley before first peak
-        first_peak = peaks[0]
-        first_valley_idx = 0
-        while first_valley_idx < len(valleys) and valleys[first_valley_idx] < first_peak:
-            first_valley_idx += 1
-        
-        if first_valley_idx > 0:  # We found a valley before the first peak
-            first_valley_idx -= 1
-            current_valley = valleys[first_valley_idx]
-            valley_idx = first_valley_idx + 1
+    # Calculate derivatives of normalized signal
+    d1 = sp.savgol_filter(normalized_signal, 9, 2, deriv=1)  # First derivative
+    d2 = sp.savgol_filter(normalized_signal, 9, 2, deriv=2)  # Second derivative
+    
+    # Find zero crossings in first derivative
+    zero_crossings = np.where(np.diff(np.signbit(d1)))[0]
+    
+    # Separate into peaks (positive to negative) and valleys (negative to positive)
+    peaks = []
+    valleys = []
+    min_distance = int(fs * 60/360)  # Minimum distance between peaks (optimized threshold)
+    
+    last_peak = -min_distance
+    last_valley = -min_distance
+    
+    for i in range(len(zero_crossings)-1):
+        idx = zero_crossings[i]
+        if idx + 1 >= len(d1):  # Ensure we don't go out of bounds
+            continue
             
-            for peak_idx in range(len(peaks)-1):
-                current_peak = peaks[peak_idx]
-                next_peak = peaks[peak_idx + 1]
+        # Check if it's a valid peak or valley
+        if d1[idx] >= 0 and d1[idx+1] < 0:  # Positive to negative = peak
+            if idx - last_peak >= min_distance:
+                peaks.append(idx)
+                last_peak = idx
                 
-                # Find next valley between current peak and next peak
-                while valley_idx < len(valleys) and valleys[valley_idx] <= current_peak:
-                    valley_idx += 1
-                    
-                if valley_idx >= len(valleys):
-                    break
-                    
-                next_valley = valleys[valley_idx]
-                
-                # If we have a valid valley-peak-valley sequence
-                if current_valley < current_peak < next_valley < next_peak:
-                    valid_peaks.append(current_peak)
-                    valid_valleys.append(current_valley)
-                    current_valley = next_valley
-            
-            # Add the last valley if we have one
-            if valley_idx < len(valleys):
-                valid_valleys.append(valleys[valley_idx])
+        elif d1[idx] < 0 and d1[idx+1] >= 0:  # Negative to positive = valley
+            if idx - last_valley >= min_distance:
+                valleys.append(idx)
+                last_valley = idx
     
-    if len(valid_peaks) < 2 or len(valid_valleys) < 2:
+    peaks = np.array(peaks)
+    valleys = np.array(valleys)
+    
+    if len(peaks) < 2 or len(valleys) < 2:
         return None
-        
-    valid_peaks = np.array(valid_peaks)
-    valid_valleys = np.array(valid_valleys)
     
-    # Create continuous lower envelope across all valleys
-    # Add extra valleys at the start and end to prevent edge effects
-    from scipy.interpolate import interp1d
+    # Create complete upper and lower envelopes
+    time_points = np.arange(len(normalized_signal))
     
-    # Add extra valleys at edges if needed
-    all_valleys = list(valid_valleys)
-    if valid_valleys[0] > valid_peaks[0]:
-        # Add valley before first peak using linear extrapolation
-        valley_before = valid_valleys[0] - (valid_valleys[1] - valid_valleys[0])
-        valley_height = signal[valid_valleys[0]] - (signal[valid_valleys[1]] - signal[valid_valleys[0]])
-        all_valleys.insert(0, valley_before)
-        
-    if valid_valleys[-1] < valid_peaks[-1]:
-        # Add valley after last peak using linear extrapolation
-        valley_after = valid_valleys[-1] + (valid_valleys[-1] - valid_valleys[-2])
-        valley_height = signal[valid_valleys[-1]] - (signal[valid_valleys[-1]] - signal[valid_valleys[-2]])
-        all_valleys.append(valley_after)
+    # Create upper envelope by connecting all peaks
+    upper_envelope = np.interp(time_points, peaks, normalized_signal[peaks])
     
-    all_valleys = np.array(all_valleys)
-    valley_interpolator = interp1d(all_valleys, signal[all_valleys], kind='cubic', 
-                                 fill_value='extrapolate')
+    # Create lower envelope by connecting all valleys
+    lower_envelope = np.interp(time_points, valleys, normalized_signal[valleys])
     
     # Calculate areas for each cycle
     tpa_list = []  # Total Pulse Area (under curve)
@@ -469,30 +445,33 @@ def analyze_ppg_cycle(signal, fs, show_plot=False):
         # Plot signal and detected points
         plt.subplot(2, 1, 1)
         time = np.arange(len(signal)) / fs
-        plt.plot(time, signal, label='PPG Signal')
-        plt.plot(valid_peaks/fs, signal[valid_peaks], 'ro', label='Peaks')
-        plt.plot(valid_valleys/fs, signal[valid_valleys], 'go', label='Valleys')
+        plt.plot(time, normalized_signal, label='Normalized PPG Signal')
+        plt.plot(peaks/fs, normalized_signal[peaks], 'ro', label='Peaks')
+        plt.plot(valleys/fs, normalized_signal[valleys], 'go', label='Valleys')
+        plt.plot(time, baseline/np.mean(baseline), 'k--', alpha=0.5, label='Baseline')
+        
+        # Plot complete envelopes
+        plt.plot(time, upper_envelope, 'b--', alpha=0.5, label='Upper Envelope')
+        plt.plot(time, lower_envelope, 'r--', alpha=0.5, label='Lower Envelope')
     
     # Calculate areas and shade them
-    for i in range(len(valid_peaks)-1):
-        peak = valid_peaks[i]
-        next_peak = valid_peaks[i+1]
+    for i in range(len(peaks)-1):
+        peak = peaks[i]
+        next_peak = peaks[i+1]
         
         # Get all points between peaks
         t_segment = np.arange(peak, next_peak+1)
-        signal_segment = signal[peak:next_peak+1]
+        signal_segment = normalized_signal[peak:next_peak+1]
         
-        # Create upper envelope by connecting peaks
-        upper_envelope = np.linspace(signal[peak], signal[next_peak], len(t_segment))
-        
-        # Get lower envelope values for this segment using the continuous interpolator
-        lower_envelope = valley_interpolator(t_segment)
+        # Get envelope values for this segment
+        upper_segment = upper_envelope[peak:next_peak+1]
+        lower_segment = lower_envelope[peak:next_peak+1]
         
         # Calculate VPA (area between upper envelope and curve)
-        vpa = abs(np.trapezoid(upper_envelope - signal_segment, dx=1/fs))
+        vpa = abs(np.trapezoid(upper_segment - signal_segment, dx=1/fs))
         
         # Calculate TPA (area between curve and lower envelope)
-        tpa = abs(np.trapezoid(signal_segment - lower_envelope, dx=1/fs))
+        tpa = abs(np.trapezoid(signal_segment - lower_segment, dx=1/fs))
         
         if vpa > 0 and tpa > 0:  # Ensure valid areas
             tpa_list.append(tpa)
@@ -501,7 +480,7 @@ def analyze_ppg_cycle(signal, fs, show_plot=False):
             if show_plot:
                 # Shade VPA - area between upper envelope and curve
                 plt.fill_between(time[peak:next_peak+1], 
-                               upper_envelope,
+                               upper_segment,
                                signal_segment,
                                alpha=0.3, color='blue', 
                                label='VPA' if i==0 else "")
@@ -509,13 +488,9 @@ def analyze_ppg_cycle(signal, fs, show_plot=False):
                 # Shade TPA - area between curve and lower envelope
                 plt.fill_between(time[peak:next_peak+1],
                                signal_segment,
-                               lower_envelope,
+                               lower_segment,
                                alpha=0.3, color='red', 
                                label='TPA' if i==0 else "")
-                
-                # Plot envelopes
-                plt.plot(time[peak:next_peak+1], upper_envelope, 'b--', alpha=0.5, label='Upper Envelope' if i==0 else "")
-                plt.plot(time[peak:next_peak+1], lower_envelope, 'r--', alpha=0.5, label='Lower Envelope' if i==0 else "")
     
     # Calculate ratio
     if len(tpa_list) > 0:
@@ -527,13 +502,11 @@ def analyze_ppg_cycle(signal, fs, show_plot=False):
         plt.title(f'PPG Analysis - TPA/VPA Ratio: {tpa_vpa_ratio:.3f}')
         plt.legend()
         plt.xlabel('Time (s)')
-        plt.ylabel('Normalized Amplitude')
+        plt.ylabel('Normalized Signal')
         plt.grid(True)
         
         # Plot derivatives for reference
         plt.subplot(2, 1, 2)
-        d1 = sp.savgol_filter(signal, 9, 2, deriv=1)
-        d2 = sp.savgol_filter(signal, 9, 2, deriv=2)
         plt.plot(time, d1, label='First Derivative')
         plt.plot(time, d2, label='Second Derivative')
         plt.title('Signal Derivatives')
@@ -546,7 +519,7 @@ def analyze_ppg_cycle(signal, fs, show_plot=False):
         plt.show()
     
     return {
-        'num_peaks': len(valid_peaks),
+        'num_peaks': len(peaks),
         'tpa_vpa_ratio': tpa_vpa_ratio,
         'avg_tpa': np.mean(tpa_list) if len(tpa_list) > 0 else 0,
         'avg_vpa': np.mean(vpa_list) if len(vpa_list) > 0 else 0
@@ -559,9 +532,6 @@ def analyze_file(filepath, show_plot=False):
         df = pd.read_csv(filepath)
         green = df.iloc[:, 0].values
         fs = 100
-        
-        # Preprocess signal
-        green = (green - np.min(green)) / (np.max(green) - np.min(green))
         
         # Analyze signal
         results = analyze_ppg_cycle(green, fs, show_plot)
@@ -579,6 +549,7 @@ def main():
     # Analyze all files
     file_results = []  # List of (filepath, results) tuples
     all_ratios = []
+    all_files = []
     
     for filepath in csv_files:
         results = analyze_file(filepath, show_plot=False)  # Don't show plots yet
@@ -586,41 +557,71 @@ def main():
         if results and results['tpa_vpa_ratio'] > 0:  # Only include valid ratios
             file_results.append((filepath, results))
             all_ratios.append(results['tpa_vpa_ratio'])
+            all_files.append(filepath)
     
-    # Sort by TPA/VPA ratio to find outliers
-    file_results.sort(key=lambda x: x[1]['tpa_vpa_ratio'], reverse=True)
+    # Show 5 random samples
+    print("\nAnalyzing 5 Random Samples:")
+    sample_indices = np.random.choice(len(file_results), 5, replace=False)
     
-    # Show the top 5 outliers
-    print("\nTop 5 Outliers:")
-    for filepath, results in file_results[:5]:
-        print(f"\nAnalyzing outlier: {os.path.basename(filepath)}")
+    for idx in sample_indices:
+        filepath, results = file_results[idx]
+        print(f"\nAnalyzing sample: {os.path.basename(filepath)}")
         print(f"TPA/VPA Ratio: {results['tpa_vpa_ratio']:.3f}")
-        # Re-analyze with plots
-        analyze_file(filepath, show_plot=True)
+        
+        # Load and analyze the signal
+        signal = pd.read_csv(filepath).iloc[:, 0].values
+        analyze_ppg_cycle(signal, fs=100, show_plot=True)
     
-    # Print overall statistics
-    print("\nOverall Statistics:")
+    # Calculate statistics on full dataset
     ratios = np.array(all_ratios)
-    print(f"Number of valid samples: {len(ratios)}")
-    print(f"Average TPA/VPA Ratio: {np.mean(ratios):.3f} ± {np.std(ratios):.3f}")
-    print(f"Range: {np.min(ratios):.3f} to {np.max(ratios):.3f}")
+    mean_ratio = np.mean(ratios)
+    std_ratio = np.std(ratios)
+    
+    # Calculate hydration thresholds
+    normal_upper = mean_ratio + std_ratio
+    normal_lower = mean_ratio - std_ratio
+    dehydration_severe = mean_ratio - 2*std_ratio
+    overhydration_threshold = normal_upper
     
     # Create histogram
     plt.figure(figsize=(12, 6))
-    plt.hist(ratios, bins=30, edgecolor='black')
-    plt.title('Distribution of TPA/VPA Ratios in Regular PPG Signals')
+    
+    # Calculate number of bins using Freedman-Diaconis rule
+    q75, q25 = np.percentile(ratios, [75, 25])
+    iqr = q75 - q25
+    bin_width = 2 * iqr / (len(ratios) ** (1/3))
+    num_bins = int((np.max(ratios) - np.min(ratios)) / bin_width)
+    
+    plt.hist(ratios, bins=num_bins, edgecolor='black')
+    plt.title('Distribution of TPA/VPA Ratios')
     plt.xlabel('TPA/VPA Ratio')
     plt.ylabel('Frequency')
     
-    # Add mean and std lines
-    mean_ratio = np.mean(ratios)
-    std_ratio = np.std(ratios)
-    plt.axvline(mean_ratio, color='r', linestyle='--', label=f'Mean: {mean_ratio:.3f}')
-    plt.axvline(mean_ratio + std_ratio, color='g', linestyle=':', label=f'Mean ± SD: {mean_ratio:.3f} ± {std_ratio:.3f}')
-    plt.axvline(mean_ratio - std_ratio, color='g', linestyle=':')
+    # Add mean and threshold lines
+    plt.axvline(mean_ratio, color='r', linestyle='--', 
+                label=f'Mean: {mean_ratio:.3f}')
+    plt.axvline(normal_lower, color='y', linestyle=':', 
+                label=f'Mild Dehydration: <{normal_lower:.3f}')
+    plt.axvline(dehydration_severe, color='r', linestyle=':', 
+                label=f'Severe Dehydration: <{dehydration_severe:.3f}')
+    plt.axvline(normal_upper, color='y', linestyle=':', 
+                label=f'Overhydration: >{normal_upper:.3f}')
     
     plt.legend()
     plt.grid(True)
+    
+    # Print statistics
+    print("\nDataset Statistics:")
+    print(f"Number of samples: {len(ratios)}")
+    print(f"Average TPA/VPA Ratio: {mean_ratio:.3f} ± {std_ratio:.3f}")
+    print(f"Range: {np.min(ratios):.3f} to {np.max(ratios):.3f}")
+    
+    print("\nProposed Hydration Thresholds:")
+    print(f"Normal Range: {normal_lower:.3f} - {normal_upper:.3f}")
+    print(f"Mild Dehydration: <{normal_lower:.3f}")
+    print(f"Severe Dehydration: <{dehydration_severe:.3f}")
+    print(f"Overhydration: >{normal_upper:.3f}")
+    
     plt.show()
 
 if __name__ == "__main__":
