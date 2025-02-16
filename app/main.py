@@ -12,94 +12,114 @@
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 import os
+from datetime import datetime
+import json
 
-# Replace 'path/to/your/serviceAccountKey.json' with the actual path
-cred = credentials.Certificate("app/serviceAccountKey.json")
-firebase_admin.initialize_app(cred)
-
-db = firestore.client()
-
-# Read data
-users_ref = db.collection("users")  # Replace 'users' with your collection name
-docs = users_ref.stream()
-# for doc in docs:
-# print(f'{doc.id} => {doc.to_dict()}')
-
-
-# Write data
-# new_user_ref = users_ref.add({
-#     'first': 'Alan',
-#     'last': 'Turing',
-#     'born': 1912
-# })
-# print(f'Added user with ID: {new_user_ref[1].id}')
-
-# Remember to shut down the app when you're done
-firebase_admin.delete_app(firebase_admin.get_app())
-
-
-# Initialize the Firebase Admin SDK.  Only do this once per application.
-firebase_admin.initialize_app(
-    cred,
-    {
-        "storageBucket": "hyd-ration-ut5jsu.firebasestorage.app"  # Replace with your bucket name
-    },
-)
-
-# Get a reference to the Firebase Storage bucket.
-bucket = storage.bucket()
-
-
-def list_files(prefix=None):
-    """Lists files in the bucket, optionally filtering by prefix."""
-    blobs = bucket.list_blobs(prefix=prefix)
-    for blob in blobs:
-        print(f"File: {blob.name}, Size: {blob.size} bytes")
-
-
-def download_file(file_path, destination_path):
-    """Downloads a file from Firebase Storage."""
-    blob = bucket.blob(file_path)
-    if blob.exists():
-        blob.download_to_filename(destination_path)
-        print(f"File '{file_path}' downloaded to '{destination_path}'")
-    else:
-        print(f"File '{file_path}' not found in Firebase Storage.")
-
-
-def upload_file(file_path, destination_path):
-    """Uploads a file to Firebase Storage."""
-    blob = bucket.blob(destination_path)
-    blob.upload_from_filename(file_path)
-    print(f"File '{file_path}' uploaded to '{destination_path}'")
-
-
-# Example Usage
-list_files("")  # List files with "images" prefix
-# download_file("images/myimage.jpg", "local/myimage.jpg")
-# upload_file("local/new_image.png", "images/new_image.png")
-
-# Remember to shut down the app when you're finished
-firebase_admin.delete_app(firebase_admin.get_app())
-
-# Create media directory if it doesn't exist
+# Create directories if they don't exist
 media_dir = os.path.join("app", "media")
 os.makedirs(media_dir, exist_ok=True)
 
+# Initialize Firebase Admin SDK once
+cred = credentials.Certificate("app/serviceAccountKey.json")
+firebase_admin.initialize_app(
+    cred, {"storageBucket": "hyd-ration-ut5jsu.firebasestorage.app"}
+)
 
-def download_all_files():
-    """Downloads all files from Firebase Storage to media folder."""
+# Get references
+db = firestore.client()
+bucket = storage.bucket()
+
+
+def get_user_id_from_path(file_path):
+    """Extract user ID from file path (users/{user_id}/uploads/...)"""
+    parts = file_path.split("/")
+    return parts[1] if len(parts) > 1 else None
+
+
+def process_and_store_image_data():
+    """Process images and store metadata in Firestore using batch operations"""
     blobs = bucket.list_blobs()
+    results = {}
+    batch = db.batch()
+
     for blob in blobs:
         destination_path = os.path.join(media_dir, blob.name)
-        # Create subdirectories if needed
-        os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-        blob.download_to_filename(destination_path)
-        print(f"Downloaded: {blob.name}")
+        user_id = get_user_id_from_path(blob.name)
+
+        if not user_id:
+            continue
+
+        # Get or create user's results document
+        if user_id not in results:
+            results[user_id] = {
+                "images": [],
+                "last_updated": datetime.now().isoformat(),
+                "user_id": user_id,
+            }
+
+        # Process new images
+        if not os.path.exists(destination_path):
+            os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+            blob.download_to_filename(destination_path)
+            print(f"Downloaded new file: {blob.name}")
+
+            image_data = {
+                "path": blob.name,
+                "created_at": (
+                    blob.time_created.isoformat()
+                    if blob.time_created
+                    else datetime.now().isoformat()
+                ),
+                "size": blob.size,
+                "content_type": blob.content_type,
+            }
+            results[user_id]["images"].append(image_data)
+
+    # Store results in Firestore using batch
+    for user_id, data in results.items():
+        if data["images"]:
+            doc_ref = db.collection("results").document(user_id)
+            doc = doc_ref.get()
+
+            if doc.exists:
+                existing_data = doc.to_dict()
+                all_images = existing_data.get("images", []) + data["images"]
+
+                batch.update(
+                    doc_ref,
+                    {
+                        "images": all_images,
+                        "last_updated": data["last_updated"],
+                        "total_images": len(all_images),
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                )
+            else:
+                batch.set(
+                    doc_ref,
+                    {
+                        "user_id": user_id,
+                        "images": data["images"],
+                        "last_updated": data["last_updated"],
+                        "total_images": len(data["images"]),
+                        "created_at": firestore.SERVER_TIMESTAMP,
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                )
+
+    # Commit the batch
+    batch.commit()
+    print("All documents updated successfully in batch")
+
+    # Save results to output file
+    output_path = "app/output_results.json"
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Results saved to {output_path}")
 
 
-# Download all files
-download_all_files()
+# Process images and store results
+process_and_store_image_data()
 
 # Cleanup
 firebase_admin.delete_app(firebase_admin.get_app())
